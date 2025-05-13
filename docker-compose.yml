@@ -1,0 +1,221 @@
+services:
+       soulseek-automation:
+         build:
+           context: .
+           dockerfile_inline: |
+             FROM python:3.9-slim
+             RUN apt-get update && apt-get install -y --no-install-recommends git \
+                 && rm -rf /var/lib/apt/lists/*
+             WORKDIR /app
+             RUN echo '\
+             import os\n\
+             import logging\n\
+             import spotipy\n\
+             from spotipy.oauth2 import SpotifyClientCredentials, CacheFileHandler\n\
+             import slskd_api\n\
+             import time\n\
+             from datetime import datetime\n\
+             \n\
+             # Set up logging\n\
+             logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")\n\
+             \n\
+             # Load environment variables\n\
+             SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")\n\
+             SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")\n\
+             PLAYLIST_ID = os.getenv("PLAYLIST_ID")\n\
+             SLSKD_URL = os.getenv("SLSKD_URL")\n\
+             SLSKD_API_KEY = os.getenv("SLSKD_API_KEY")\n\
+             DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR")\n\
+             LOG_FILE = os.getenv("LOG_FILE")\n\
+             DOWNLOADED_LOG = os.getenv("DOWNLOADED_LOG", "/logs/downloaded.log")\n\
+             \n\
+             # Ensure log directory exists\n\
+             os.makedirs(os.path.dirname(DOWNLOADED_LOG), exist_ok=True)\n\
+             \n\
+             # Preferred Formats\n\
+             PREFERRED_FORMATS = ["WAV", "FLAC", "AIFF"]\n\
+             \n\
+             def authenticate_spotify():\n\
+                 cache_path = os.path.join(os.path.dirname(__file__), "cache", ".cache")\n\
+                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)\n\
+                 cache_handler = CacheFileHandler(cache_path=cache_path)\n\
+                 client_credentials_manager = SpotifyClientCredentials(\n\
+                     client_id=SPOTIFY_CLIENT_ID,\n\
+                     client_secret=SPOTIFY_CLIENT_SECRET,\n\
+                     cache_handler=cache_handler\n\
+                 )\n\
+                 return spotipy.Spotify(client_credentials_manager=client_credentials_manager)\n\
+             \n\
+             def get_playlist_songs(sp):\n\
+                 try:\n\
+                     results = sp.playlist_items(PLAYLIST_ID)\n\
+                     songs = []\n\
+                     for item in results["items"]:\n\
+                         track = item["track"]\n\
+                         song_name = track["name"]\n\
+                         artist = track["artists"][0]["name"]\n\
+                         track_id = track["id"]\n\
+                         songs.append({"id": track_id, "query": f"{artist} - {song_name}"})\n\
+                     return songs\n\
+                 except Exception as e:\n\
+                     logging.error(f"Failed to retrieve playlist songs: {str(e)}")\n\
+                     return []\n\
+             \n\
+             def load_downloaded_songs():\n\
+                 downloaded = set()\n\
+                 try:\n\
+                     if os.path.exists(DOWNLOADED_LOG):\n\
+                         with open(DOWNLOADED_LOG, "r") as f:\n\
+                             for line in f:\n\
+                                 track_id = line.strip().split(" - ")[-1]\n\
+                                 downloaded.add(track_id)\n\
+                     else:\n\
+                         logging.info(f"No existing downloaded log found at {DOWNLOADED_LOG}")\n\
+                 except Exception as e:\n\
+                     logging.error(f"Failed to load downloaded songs: {str(e)}")\n\
+                 return downloaded\n\
+             \n\
+             def log_downloaded(track_id, filename):\n\
+                 try:\n\
+                     with open(DOWNLOADED_LOG, "a") as f:\n\
+                         f.write(f"{datetime.now()} - Downloaded: {filename} - {track_id}\\n")\n\
+                     logging.debug(f"Logged download: {track_id} - {filename}")\n\
+                 except Exception as e:\n\
+                     logging.error(f"Failed to log downloaded song to {DOWNLOADED_LOG}: {str(e)}")\n\
+             \n\
+             def search_and_download_slskd(query):\n\
+                 client = slskd_api.SlskdClient(SLSKD_URL, SLSKD_API_KEY)\n\
+                 \n\
+                 # Initiate search\n\
+                 try:\n\
+                     logging.debug(f"Searching for: {query}")\n\
+                     search_response = client.searches.search_text(query)\n\
+                     search_id = search_response["id"]\n\
+                     logging.debug(f"Search ID: {search_id}")\n\
+                 except Exception as e:\n\
+                     logging.error(f"Search initiation failed: {str(e)}")\n\
+                     return False, f"Search failed: {str(e)}"\n\
+                 \n\
+                 # Poll for responses (10 attempts, 30s intervals = 5 minutes total)\n\
+                 for attempt in range(10):\n\
+                     time.sleep(30)\n\
+                     try:\n\
+                         responses = client.searches.search_responses(search_id)\n\
+                         logging.debug(f"Attempt {attempt + 1} - Raw responses: {responses}")\n\
+                         if responses and any(r.get("files") or r.get("locked_files") for r in responses):\n\
+                             break\n\
+                     except Exception as e:\n\
+                         logging.warning(f"Polling attempt {attempt + 1} failed: {str(e)}")\n\
+                         continue\n\
+                 else:\n\
+                     logging.warning("No responses found after extended polling")\n\
+                     return False, "No responses found after extended polling"\n\
+                 \n\
+                 # Process responses for preferred formats\n\
+                 for user_response in responses:\n\
+                     all_files = user_response.get("files", []) + user_response.get("locked_files", [])\n\
+                     if not all_files:\n\
+                         logging.debug(f"No files from user {user_response.get('username', 'unknown')}")\n\
+                         continue\n\
+                     \n\
+                     for file in all_files:\n\
+                         logging.debug(f"Found file: {file}")\n\
+                         ext = file.get("extension", "").upper()\n\
+                         if not ext:\n\
+                             filename = file["filename"]\n\
+                             ext = filename.rsplit(".", 1)[-1].upper() if "." in filename else ""\n\
+                         \n\
+                         if ext in PREFERRED_FORMATS:\n\
+                             username = user_response["username"]\n\
+                             try:\n\
+                                 logging.debug(f"Enqueuing download for file: {file['filename']} from user: {username}")\n\
+                                 client.transfers.enqueue(\n\
+                                     username=username,\n\
+                                     files=[{"filename": file["filename"], "size": file.get("size", 0)}]\n\
+                                 )\n\
+                                 logging.info(f"Successfully enqueued download for file: {file['filename']} from user: {username}")\n\
+                                 return True, file["filename"]\n\
+                             except Exception as e:\n\
+                                 logging.warning(f"Failed to enqueue download from {username}: {str(e)}")\n\
+                                 continue\n\
+                 \n\
+                 # Fallback to MP3 if no preferred formats found\n\
+                 logging.info("No preferred formats found. Falling back to MP3...")\n\
+                 for user_response in responses:\n\
+                     all_files = user_response.get("files", []) + user_response.get("locked_files", [])\n\
+                     for file in all_files:\n\
+                         ext = file.get("extension", "").upper()\n\
+                         if not ext:\n\
+                             filename = file["filename"]\n\
+                             ext = filename.rsplit(".", 1)[-1].upper() if "." in filename else ""\n\
+                         \n\
+                         if ext == "MP3":\n\
+                             username = user_response["username"]\n\
+                             try:\n\
+                                 logging.debug(f"Enqueuing download for MP3 file: {file['filename']} from user: {username}")\n\
+                                 client.transfers.enqueue(\n\
+                                     username=username,\n\
+                                     files=[{"filename": file["filename"], "size": file.get("size", 0)}]\n\
+                                 )\n\
+                                 logging.info(f"Successfully enqueued download for MP3 file: {file['filename']} from user: {username}")\n\
+                                 return True, file["filename"]\n\
+                             except Exception as e:\n\
+                                 logging.warning(f"Failed to enqueue MP3 download from {username}: {str(e)}")\n\
+                                 continue\n\
+                 \n\
+                 logging.warning("No suitable format found or all download attempts failed")\n\
+                 return False, "No suitable format found or all download attempts failed"\n\
+             \n\
+             def log_not_found(song):\n\
+                 try:\n\
+                     with open(LOG_FILE, "a") as f:\n\
+                         f.write(f"{datetime.now()} - Not found: {song}\\n")\n\
+                 except Exception as e:\n\
+                     logging.error(f"Failed to write to log file: {str(e)}")\n\
+             \n\
+             def main():\n\
+                 sp = authenticate_spotify()\n\
+                 downloaded_songs = load_downloaded_songs()\n\
+                 \n\
+                 while True:\n\
+                     logging.info("Checking playlist for new songs...")\n\
+                     current_songs = get_playlist_songs(sp)\n\
+                     \n\
+                     for song in current_songs:\n\
+                         track_id = song["id"]\n\
+                         query = song["query"]\n\
+                         if track_id not in downloaded_songs:\n\
+                             logging.info(f"Searching for: {query} (Track ID: {track_id})")\n\
+                             success, message = search_and_download_slskd(query)\n\
+                             if success:\n\
+                                 logging.info(f"Downloaded: {message}")\n\
+                                 downloaded_songs.add(track_id)\n\
+                                 log_downloaded(track_id, message)\n\
+                             else:\n\
+                                 logging.warning(f"Failed: {message}")\n\
+                                 log_not_found(query)\n\
+                     \n\
+                     logging.info("Waiting for next check...")\n\
+                     time.sleep(3600)\n\
+             \n\
+             if __name__ == "__main__":\n\
+                 main()\n\
+             ' > spotify_soulseek_automation.py
+             RUN pip install --no-cache-dir spotipy requests \
+                 && pip install git+https://github.com/bigoulours/slskd-api.git
+             RUN mkdir -p /downloads /logs
+             CMD ["python3", "spotify_soulseek_automation.py"]
+         container_name: soulseek-automation
+         volumes:
+           - ./logs:/logs:rw
+           - ./downloads:/downloads:rw
+         environment:
+           - SPOTIFY_CLIENT_ID
+           - SPOTIFY_CLIENT_SECRET
+           - PLAYLIST_ID
+           - SLSKD_URL
+           - SLSKD_API_KEY
+           - DOWNLOAD_DIR=/downloads
+           - LOG_FILE=/logs/not_found.log
+           - DOWNLOADED_LOG=/logs/downloaded.log
+         restart: unless-stopped
